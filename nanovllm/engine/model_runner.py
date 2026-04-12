@@ -6,10 +6,21 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+
+
+def _create_model(config: Config):
+    hf_config = config.hf_config
+    text_config = config.hf_text_config
+    model_type = getattr(text_config, 'model_type', '')
+    if 'qwen3_5' in model_type:
+        from nanovllm.models.qwen3_5_moe import Qwen3_5MoeForCausalLM
+        return Qwen3_5MoeForCausalLM(text_config)
+    else:
+        from nanovllm.models.qwen3 import Qwen3ForCausalLM
+        return Qwen3ForCausalLM(hf_config)
 
 
 class ModelRunner:
@@ -26,11 +37,12 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
+        torch.set_default_dtype(config.hf_text_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = _create_model(config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        self.num_gdn_layers = 0  # set before warmup; updated in allocate_kv_cache
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -92,30 +104,73 @@ class ModelRunner:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        # For MoE models, use smaller warmup to avoid OOM from gather ops
+        if self.num_gdn_layers > 0:
+            num_seqs = 1
+            warmup_len = min(max_model_len, 256)
+        else:
+            warmup_len = max_model_len
+            num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
+        seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
         config = self.config
-        hf_config = config.hf_config
+        text_config = config.hf_text_config
+        dtype = getattr(text_config, 'torch_dtype', torch.bfloat16)
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype, torch.bfloat16)
+        dtype_size = torch.tensor([], dtype=dtype).element_size()
+
+        # Count attention layers (layers with k_cache/v_cache)
+        num_attn_layers = sum(1 for m in self.model.modules()
+                              if hasattr(m, "k_cache") and hasattr(m, "v_cache"))
+        if num_attn_layers == 0:
+            num_attn_layers = text_config.num_hidden_layers
+
+        total_kv_heads = text_config.num_key_value_heads
+        num_kv_heads = max(1, total_kv_heads // self.world_size) if total_kv_heads >= self.world_size else total_kv_heads
+        head_dim = getattr(text_config, "head_dim", text_config.hidden_size // text_config.num_attention_heads)
+
+        # Allocate GDN state if model has GDN layers
+        self._allocate_gdn_state(config)
+
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        block_bytes = 2 * num_attn_layers * self.block_size * num_kv_heads * head_dim * dtype_size
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+
+        if num_attn_layers > 0:
+            self.kv_cache = torch.empty(2, num_attn_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+            layer_id = 0
+            for module in self.model.modules():
+                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                    module.k_cache = self.kv_cache[0, layer_id]
+                    module.v_cache = self.kv_cache[1, layer_id]
+                    layer_id += 1
+
+    def _allocate_gdn_state(self, config: Config):
+        """Pre-allocate conv_state and temporal_state for GDN layers."""
+        from nanovllm.layers.gdn import GDNAttention
+        gdn_layers = [m for m in self.model.modules() if isinstance(m, GDNAttention)]
+        self.num_gdn_layers = len(gdn_layers)
+        if self.num_gdn_layers == 0:
+            return
+
+        max_seqs = min(config.max_num_seqs, 128)  # limit GDN state memory
+        for layer in gdn_layers:
+            layer.conv_state = torch.zeros(
+                max_seqs, layer.conv_dim, layer.conv_kernel_size - 1,
+                dtype=torch.bfloat16, device="cuda")
+            layer.temporal_state = torch.zeros(
+                max_seqs,
+                layer.num_v_heads // layer.tp_size,
+                layer.head_k_dim, layer.head_v_dim,
+                dtype=torch.float32, device="cuda")
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -158,7 +213,12 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        gdn_state_indices = None
+        seq_lens = None
+        if self.num_gdn_layers > 0:
+            gdn_state_indices = torch.tensor([seq.gdn_state_idx for seq in seqs], dtype=torch.int64, device="cuda")
+            seq_lens = [len(seq) - seq.num_cached_tokens for seq in seqs]
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, gdn_state_indices, seq_lens)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -176,7 +236,10 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        gdn_state_indices = None
+        if self.num_gdn_layers > 0:
+            gdn_state_indices = torch.tensor([seq.gdn_state_idx for seq in seqs], dtype=torch.int64, device="cuda")
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, gdn_state_indices=gdn_state_indices)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -202,6 +265,8 @@ class ModelRunner:
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            if "gdn_state_indices" in graph_vars and context.gdn_state_indices is not None:
+                graph_vars["gdn_state_indices"][:bs] = context.gdn_state_indices
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -216,7 +281,7 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
-        hf_config = config.hf_config
+        text_config = config.hf_text_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
@@ -224,14 +289,16 @@ class ModelRunner:
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        outputs = torch.zeros(max_bs, text_config.hidden_size)
+        gdn_state_indices = torch.zeros(max_bs, dtype=torch.int64) if self.num_gdn_layers > 0 else None
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs],
+                       gdn_state_indices=gdn_state_indices[:bs] if gdn_state_indices is not None else None)
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
@@ -241,7 +308,7 @@ class ModelRunner:
             torch.cuda.synchronize()
             reset_context()
 
-        self.graph_vars = dict(
+        graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
             slot_mapping=slot_mapping,
@@ -249,3 +316,6 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+        if gdn_state_indices is not None:
+            graph_vars["gdn_state_indices"] = gdn_state_indices
+        self.graph_vars = graph_vars

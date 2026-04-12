@@ -1,6 +1,7 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+from time import perf_counter
 
 from nanovllm.sampling_params import SamplingParams
 
@@ -27,6 +28,13 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.gdn_state_idx = -1
+        # Timing
+        self.created_time: float = perf_counter()
+        self.first_token_time: float = 0.0
+        self.finished_time: float = 0.0
+        self._last_token_time: float = 0.0
+        self.token_timestamps: list[float] = []
 
     def __len__(self):
         return self.num_tokens
@@ -70,13 +78,19 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+        now = perf_counter()
+        self.token_timestamps.append(now)
+        if self.num_completion_tokens == 1:
+            self.first_token_time = now
+        self._last_token_time = now
 
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+                self.gdn_state_idx,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, self.gdn_state_idx = state[:-1]
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:
