@@ -121,19 +121,16 @@ class GDNAttention(nn.Module):
         return output
 
     def _causal_conv1d_decode(self, x: torch.Tensor, state_indices: torch.Tensor) -> torch.Tensor:
-        """Single-step causal conv1d for decode."""
+        """Single-step causal conv1d for decode. No Python loops, CUDA Graph safe."""
         # x: [batch, conv_dim]
         weight = self.conv1d.weight  # [conv_dim, kernel]
         # Conv: dot product of [state, new_input] with kernel weights
         states = self.conv_state[state_indices]  # [batch, conv_dim, kernel-1]
         full = torch.cat([states, x.unsqueeze(-1)], dim=-1)  # [batch, conv_dim, kernel]
         output = (full * weight.unsqueeze(0)).sum(dim=-1)  # [batch, conv_dim]
-        # Update state AFTER reading: shift left, append new input
-        batch = x.size(0)
-        for i in range(batch):
-            idx = state_indices[i]
-            self.conv_state[idx, :, :-1] = self.conv_state[idx, :, 1:].clone()
-            self.conv_state[idx, :, -1] = x[i]
+        # Update state: shift left, append new input (batch vectorized, no Python loop)
+        self.conv_state[state_indices, :, :-1] = states[:, :, 1:]
+        self.conv_state[state_indices, :, -1] = x
         return output
 
     def _delta_rule_prefill(self, q, k, v, g, beta, seq_lens, state_indices):
@@ -175,35 +172,32 @@ class GDNAttention(nn.Module):
         return torch.cat(outputs, dim=0)
 
     def _delta_rule_decode(self, q, k, v, g, beta, state_indices):
-        """Single-step delta rule for decode using HF-compatible implementation."""
+        """Single-step delta rule for decode. Batch vectorized, CUDA Graph safe."""
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import torch_recurrent_gated_delta_rule
 
-        batch = q.size(0)
         num_v_heads = v.size(1)
         n_rep = num_v_heads // q.size(1)
         if n_rep > 1:
             q = q.repeat_interleave(n_rep, dim=1)
             k = k.repeat_interleave(n_rep, dim=1)
 
-        output = torch.zeros_like(v)
-        for i in range(batch):
-            idx = state_indices[i]
-            qi = q[i:i+1].unsqueeze(1)  # [1, 1, heads, dim]
-            ki = k[i:i+1].unsqueeze(1)
-            vi = v[i:i+1].unsqueeze(1)
-            gi = g[i:i+1].unsqueeze(1)
-            bi = beta[i:i+1].unsqueeze(1)
-            init_state = self.temporal_state[idx].unsqueeze(0)
+        # Batch call: [batch, 1, heads, dim] — treat batch dim as batch
+        qi = q.unsqueeze(1)   # [batch, 1, heads, dim]
+        ki = k.unsqueeze(1)
+        vi = v.unsqueeze(1)
+        gi = g.unsqueeze(1)   # [batch, 1, heads]
+        bi = beta.unsqueeze(1)
+        init_state = self.temporal_state[state_indices]  # [batch, heads, k_dim, v_dim]
 
-            o, final_state = torch_recurrent_gated_delta_rule(
-                qi, ki, vi, gi, bi,
-                initial_state=init_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-            )
-            output[i] = o.squeeze(0).squeeze(0)
-            if final_state is not None:
-                self.temporal_state[idx] = final_state.squeeze(0)
+        o, final_state = torch_recurrent_gated_delta_rule(
+            qi, ki, vi, gi, bi,
+            initial_state=init_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        output = o.squeeze(1)  # [batch, heads, v_dim]
+        if final_state is not None:
+            self.temporal_state[state_indices] = final_state
         return output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

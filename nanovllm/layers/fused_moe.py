@@ -9,7 +9,50 @@ import triton.language as tl
 
 
 # ---------------------------------------------------------------------------
-# Token alignment (pure PyTorch)
+# Triton kernels for token alignment (CUDA Graph compatible)
+# Replaces argsort + scatter with atomic operations
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _moe_count_kernel(flat_ids_ptr, counts_ptr, num_tokens, BLOCK: tl.constexpr):
+    """Count tokens per expert using atomic add."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < num_tokens
+    expert = tl.load(flat_ids_ptr + offs, mask=mask, other=0)
+    tl.atomic_add(counts_ptr + expert, 1, mask=mask)
+
+
+@triton.jit
+def _moe_scatter_kernel(flat_ids_ptr, cumsum_ptr, counter_ptr, sorted_ids_ptr,
+                        num_tokens, BLOCK: tl.constexpr):
+    """Scatter tokens into sorted positions using atomic add for within-expert offset."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < num_tokens
+    expert = tl.load(flat_ids_ptr + offs, mask=mask, other=0).to(tl.int64)
+    # Atomic add to get unique position within expert group
+    pos = tl.atomic_add(counter_ptr + expert, 1, mask=mask).to(tl.int64)
+    # Destination = cumsum[expert] + pos
+    expert_offset = tl.load(cumsum_ptr + expert, mask=mask, other=0)
+    dest = expert_offset + pos
+    # Write token index
+    tl.store(sorted_ids_ptr + dest, offs.to(tl.int32), mask=mask)
+
+
+@triton.jit
+def _moe_expert_ids_kernel(cum_blocks_ptr, expert_ids_ptr, max_blocks,
+                           NUM_EXPERTS: tl.constexpr, BLOCK: tl.constexpr):
+    """Fill expert_ids from cumulative block counts. One program per expert."""
+    expert = tl.program_id(0)
+    start = tl.load(cum_blocks_ptr + expert).to(tl.int64)
+    end = tl.load(cum_blocks_ptr + expert + 1).to(tl.int64)
+    # Fill expert_ids[start:end] = expert
+    offs = start + tl.arange(0, BLOCK).to(tl.int64)
+    mask = (offs < end) & (offs < max_blocks)
+    tl.store(expert_ids_ptr + offs, tl.full((BLOCK,), expert, dtype=tl.int32), mask=mask)
+
+
+# ---------------------------------------------------------------------------
+# Token alignment wrapper (CUDA Graph safe — no argsort, no .item())
 # ---------------------------------------------------------------------------
 
 def moe_align_block_size(
@@ -20,13 +63,15 @@ def moe_align_block_size(
     expert_ids_buf: torch.Tensor | None = None,
     num_tokens_post_padded_buf: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sort tokens by expert, pad to block_size. Fully Triton-based, CUDA Graph safe."""
     M, top_k = topk_ids.shape
     num_tokens = M * top_k
     max_num_tokens_padded = num_tokens + num_experts * (block_size - 1)
     max_blocks = max_num_tokens_padded // block_size
     device = topk_ids.device
-    flat_ids = topk_ids.view(-1)
+    flat_ids = topk_ids.view(-1).to(torch.int32)
 
+    # Allocate or reuse buffers
     if sorted_token_ids_buf is None:
         sorted_token_ids_buf = torch.empty(max_num_tokens_padded, dtype=torch.int32, device=device)
     if expert_ids_buf is None:
@@ -37,28 +82,36 @@ def moe_align_block_size(
     sorted_token_ids_buf[:max_num_tokens_padded].fill_(num_tokens)
     expert_ids_buf[:max_blocks].fill_(-1)
 
-    tokens_per_expert = torch.zeros(num_experts, dtype=torch.int64, device=device)
-    tokens_per_expert.scatter_add_(0, flat_ids.to(torch.int64),
-                                   torch.ones(num_tokens, dtype=torch.int64, device=device))
-    padded = ((tokens_per_expert + block_size - 1) // block_size * block_size)
+    # 1. Count tokens per expert (Triton atomic)
+    counts = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    grid1 = (triton.cdiv(num_tokens, 256),)
+    _moe_count_kernel[grid1](flat_ids, counts, num_tokens, BLOCK=256)
+
+    # 2. Compute padded cumsum (torch ops on small [num_experts] tensor — graph safe)
+    padded = ((counts.to(torch.int64) + block_size - 1) // block_size * block_size)
     cumsum = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
     cumsum[1:] = padded.cumsum(0)
     num_tokens_post_padded_buf[0] = cumsum[num_experts].to(torch.int32)
 
-    sorted_order = flat_ids.argsort(stable=True)
-    sorted_experts = flat_ids[sorted_order]
-    expert_boundaries = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
-    expert_boundaries[1:] = tokens_per_expert.cumsum(0)
-    sorted_positions = torch.arange(num_tokens, device=device, dtype=torch.int64)
-    expert_of_sorted = sorted_experts.to(torch.int64)
-    within_expert_offset = sorted_positions - expert_boundaries[expert_of_sorted]
-    dest = cumsum[expert_of_sorted] + within_expert_offset
-    sorted_token_ids_buf.scatter_(0, dest, sorted_order.to(torch.int32))
+    # 3. Scatter tokens to sorted positions (Triton atomic)
+    counter = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    grid2 = (triton.cdiv(num_tokens, 256),)
+    _moe_scatter_kernel[grid2](flat_ids, cumsum, counter, sorted_token_ids_buf,
+                               num_tokens, BLOCK=256)
 
-    blocks_per_expert = (padded // block_size).to(torch.int32)
-    expert_labels = torch.arange(num_experts, dtype=torch.int32, device=device)
-    valid_expert_ids = expert_labels.repeat_interleave(blocks_per_expert)
-    expert_ids_buf[:valid_expert_ids.size(0)] = valid_expert_ids
+    # 4. Fill expert_ids (Triton, one program per expert)
+    blocks_per_expert = padded // block_size
+    cum_blocks = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
+    cum_blocks[1:] = blocks_per_expert.cumsum(0)
+    # Max blocks any single expert could have (for BLOCK size)
+    max_expert_blocks = max(1, max_num_tokens_padded // block_size // num_experts + 2)
+    # Round up to power of 2 for Triton
+    triton_block = 1
+    while triton_block < max_expert_blocks:
+        triton_block *= 2
+    triton_block = max(triton_block, 16)
+    _moe_expert_ids_kernel[(num_experts,)](cum_blocks, expert_ids_buf, max_blocks,
+                                           NUM_EXPERTS=num_experts, BLOCK=triton_block)
 
     return sorted_token_ids_buf[:max_num_tokens_padded], expert_ids_buf[:max_blocks], num_tokens_post_padded_buf
 
