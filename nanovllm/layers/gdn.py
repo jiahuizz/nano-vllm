@@ -126,8 +126,11 @@ class GDNAttention(nn.Module):
         return fused_conv1d_update(x, self.conv_state, self.conv1d.weight, state_indices, silu=False)
 
     def _delta_rule_prefill(self, q, k, v, g, beta, seq_lens, state_indices):
-        """Chunked delta rule for prefill using HF-compatible implementation."""
-        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import torch_chunk_gated_delta_rule
+        """Chunked delta rule for prefill using Triton FLA kernels.
+
+        Replaces the HF PyTorch for-loop with a single batched call via cu_seqlens.
+        """
+        from nanovllm.layers.fla_ops import chunk_gated_delta_rule
 
         # GQA expansion: num_k_heads -> num_v_heads
         num_v_heads = v.size(1)
@@ -136,32 +139,36 @@ class GDNAttention(nn.Module):
             q = q.repeat_interleave(n_rep, dim=1)
             k = k.repeat_interleave(n_rep, dim=1)
 
-        offset = 0
-        outputs = []
+        # Pack all sequences into [1, total_tokens, H, D] for FLA's cu_seqlens API
+        q = q.unsqueeze(0)   # [1, T, H, K]
+        k = k.unsqueeze(0)
+        v = v.unsqueeze(0)
+        g = g.unsqueeze(0)   # [1, T, H]
+        beta = beta.unsqueeze(0)
+
+        # Build cu_seqlens: [0, len0, len0+len1, ...]
+        cu_seqlens = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=q.device)
         for i, slen in enumerate(seq_lens):
-            # Reshape to [batch=1, seq_len, num_heads, head_dim] for HF format
-            qi = q[offset:offset + slen].unsqueeze(0)
-            ki = k[offset:offset + slen].unsqueeze(0)
-            vi = v[offset:offset + slen].unsqueeze(0)
-            gi = g[offset:offset + slen].unsqueeze(0).unsqueeze(-1)  # [1, seq, heads, 1] -> [1, seq, heads]
-            # Actually g is already [seq, heads], just unsqueeze batch
-            gi = g[offset:offset + slen].unsqueeze(0)
-            bi = beta[offset:offset + slen].unsqueeze(0)
+            cu_seqlens[i + 1] = cu_seqlens[i] + slen
 
-            idx = state_indices[i]
-            init_state = self.temporal_state[idx].unsqueeze(0) if self.temporal_state is not None else None
+        # Prepare initial_state: FLA expects [N, H, V, K], nano-vllm stores [N, H, K, V]
+        init_state = None
+        if self.temporal_state is not None:
+            init_state = self.temporal_state[state_indices].transpose(-1, -2).contiguous()
 
-            o, final_state = torch_chunk_gated_delta_rule(
-                qi, ki, vi, gi, bi,
-                initial_state=init_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-            )
-            outputs.append(o.squeeze(0))
-            if self.temporal_state is not None and final_state is not None:
-                self.temporal_state[idx] = final_state.squeeze(0)
-            offset += slen
-        return torch.cat(outputs, dim=0)
+        o, final_state = chunk_gated_delta_rule(
+            q, k, v, g, beta,
+            initial_state=init_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        # Write back final_state: FLA returns [N, H, V, K] -> transpose to [N, H, K, V]
+        if self.temporal_state is not None and final_state is not None:
+            self.temporal_state[state_indices] = final_state.transpose(-1, -2).to(self.temporal_state.dtype)
+
+        return o.squeeze(0)  # [T, H, V]
 
     def _delta_rule_decode(self, q, k, v, g, beta, state_indices):
         """Single-step delta rule for decode. Fused Triton kernel."""

@@ -119,12 +119,24 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int] | None, is_prefill: bool):
-        """Process results. For prefill: update num_cached_tokens. For decode: append token."""
+        """Process results. For prefill: update num_cached_tokens (and append
+        the first completion token when prefill finishes). For decode: append token."""
         if is_prefill:
-            for seq in seqs:
+            for i, seq in enumerate(seqs):
                 chunk = getattr(seq, '_prefill_chunk_size', seq.num_prompt_tokens - seq.num_cached_tokens)
                 seq.num_cached_tokens += chunk
-                # If prefill is complete, the next schedule() will put it in decode
+                # When prefill completes, the model also sampled a first token — append it
+                if seq.num_cached_tokens >= seq.num_prompt_tokens and token_ids is not None:
+                    token_id = token_ids[i]
+                    seq.append_token(token_id)
+                    if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                        seq.status = SequenceStatus.FINISHED
+                        seq.finished_time = perf_counter()
+                        self.block_manager.deallocate(seq)
+                        if self.has_gdn and seq.gdn_state_idx >= 0:
+                            self.gdn_free_slots.appendleft(seq.gdn_state_idx)
+                            seq.gdn_state_idx = -1
+                        self.running.remove(seq)
         else:
             for seq, token_id in zip(seqs, token_ids):
                 seq.append_token(token_id)
