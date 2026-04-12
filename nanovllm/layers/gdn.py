@@ -121,17 +121,9 @@ class GDNAttention(nn.Module):
         return output
 
     def _causal_conv1d_decode(self, x: torch.Tensor, state_indices: torch.Tensor) -> torch.Tensor:
-        """Single-step causal conv1d for decode. No Python loops, CUDA Graph safe."""
-        # x: [batch, conv_dim]
-        weight = self.conv1d.weight  # [conv_dim, kernel]
-        # Conv: dot product of [state, new_input] with kernel weights
-        states = self.conv_state[state_indices]  # [batch, conv_dim, kernel-1]
-        full = torch.cat([states, x.unsqueeze(-1)], dim=-1)  # [batch, conv_dim, kernel]
-        output = (full * weight.unsqueeze(0)).sum(dim=-1)  # [batch, conv_dim]
-        # Update state: shift left, append new input (batch vectorized, no Python loop)
-        self.conv_state[state_indices, :, :-1] = states[:, :, 1:]
-        self.conv_state[state_indices, :, -1] = x
-        return output
+        """Single-step causal conv1d for decode. Fused Triton kernel."""
+        from nanovllm.layers.gdn_kernels import fused_conv1d_update
+        return fused_conv1d_update(x, self.conv_state, self.conv1d.weight, state_indices, silu=False)
 
     def _delta_rule_prefill(self, q, k, v, g, beta, seq_lens, state_indices):
         """Chunked delta rule for prefill using HF-compatible implementation."""
@@ -172,33 +164,17 @@ class GDNAttention(nn.Module):
         return torch.cat(outputs, dim=0)
 
     def _delta_rule_decode(self, q, k, v, g, beta, state_indices):
-        """Single-step delta rule for decode. Batch vectorized, CUDA Graph safe."""
-        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import torch_recurrent_gated_delta_rule
-
-        num_v_heads = v.size(1)
-        n_rep = num_v_heads // q.size(1)
-        if n_rep > 1:
-            q = q.repeat_interleave(n_rep, dim=1)
-            k = k.repeat_interleave(n_rep, dim=1)
-
-        # Batch call: [batch, 1, heads, dim] — treat batch dim as batch
-        qi = q.unsqueeze(1)   # [batch, 1, heads, dim]
-        ki = k.unsqueeze(1)
-        vi = v.unsqueeze(1)
-        gi = g.unsqueeze(1)   # [batch, 1, heads]
-        bi = beta.unsqueeze(1)
-        init_state = self.temporal_state[state_indices]  # [batch, heads, k_dim, v_dim]
-
-        o, final_state = torch_recurrent_gated_delta_rule(
-            qi, ki, vi, gi, bi,
-            initial_state=init_state,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
+        """Single-step delta rule for decode. Fused Triton kernel."""
+        # g and beta are not used — the fused kernel computes them internally from a, b, A_log, dt_bias
+        # We pass a and b through the context (set in forward before calling this)
+        from nanovllm.layers.gdn_kernels import fused_delta_rule_decode
+        return fused_delta_rule_decode(
+            q, k, v,
+            self._decode_a, self._decode_b,
+            self.A_log, self.dt_bias,
+            self.temporal_state, state_indices,
+            use_l2norm=True,
         )
-        output = o.squeeze(1)  # [batch, heads, v_dim]
-        if final_state is not None:
-            self.temporal_state[state_indices] = final_state
-        return output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         context = get_context()
@@ -235,19 +211,17 @@ class GDNAttention(nn.Module):
         v = v_flat.view(num_tokens, -1, self.head_v_dim)  # [N, num_v_heads/tp, head_v_dim]
         z = z.view(num_tokens, -1, self.head_v_dim)
 
-        # Note: L2 norm is done inside chunk_gated_delta_rule with use_qk_l2norm_in_kernel=True
-
-        # 4. Compute gates (use float32 for numerical stability, matching HF)
-        # g = -exp(A_log) * softplus(a + dt_bias) -- decay rate
-        # beta = sigmoid(b) -- update gate
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        beta = torch.sigmoid(b)
-
-        # 5. Delta rule recurrence
+        # 4-5. Delta rule recurrence
         if context.is_prefill:
+            # Prefill: compute g, beta explicitly for HF's chunk implementation
+            g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+            beta = torch.sigmoid(b)
             attn_out = self._delta_rule_prefill(q, k, v, g, beta, seq_lens, state_indices)
         else:
-            attn_out = self._delta_rule_decode(q, k, v, g, beta, state_indices)
+            # Decode: fused Triton kernel computes g, beta internally from a, b, A_log, dt_bias
+            self._decode_a = a
+            self._decode_b = b
+            attn_out = self._delta_rule_decode(q, k, v, None, None, state_indices)
 
         # 6. Output: RMSNormGated(output, z) -> out_proj
         attn_out = attn_out.reshape(-1, self.head_v_dim)

@@ -218,6 +218,14 @@ class ModelRunner:
         if self.num_gdn_layers > 0:
             gdn_state_indices = torch.tensor([seq.gdn_state_idx for seq in seqs], dtype=torch.int64, device="cuda")
             seq_lens = [len(seq) - seq.num_cached_tokens for seq in seqs]
+            # Zero GDN state for newly prefilled sequences (avoid stale state from previous occupants)
+            from nanovllm.layers.gdn import GDNAttention
+            for m in self.model.modules():
+                if isinstance(m, GDNAttention):
+                    if m.conv_state is not None:
+                        m.conv_state[gdn_state_indices] = 0
+                    if m.temporal_state is not None:
+                        m.temporal_state[gdn_state_indices] = 0
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, gdn_state_indices, seq_lens)
         return input_ids, positions
 
