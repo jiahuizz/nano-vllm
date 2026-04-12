@@ -66,7 +66,9 @@ def make_random_workload(num_seqs, max_input_len, max_output_len, rng_seed=42):
 BENCH_WORKER = r'''
 import json, sys, time
 
-workload = json.loads(sys.argv[1])
+workload_path = sys.argv[1]
+with open(workload_path) as f:
+    workload = json.load(f)
 engine = workload["engine"]
 model_path = workload["model"]
 prompt_token_ids = workload["prompts"]
@@ -93,7 +95,8 @@ if engine == "nanovllm":
 elif engine == "vllm":
     from vllm import LLM, SamplingParams
     llm = LLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tp_size,
-              max_model_len=2048, max_num_seqs=32, trust_remote_code=True)
+              max_model_len=2048, max_num_seqs=32, trust_remote_code=True,
+              disable_log_stats=False)
     sampling_params = [SamplingParams(temperature=1.0, ignore_eos=True, max_tokens=ol) for ol in output_lens]
     prompts = [{"prompt_token_ids": p} for p in prompt_token_ids]
     llm.generate([{"prompt_token_ids": [0]*10}], SamplingParams(max_tokens=10, ignore_eos=True))
@@ -101,27 +104,47 @@ elif engine == "vllm":
     outputs = llm.generate(prompts, sampling_params)
     elapsed = time.perf_counter() - t0
     total_completion = sum(len(o.outputs[0].token_ids) for o in outputs)
+    ttfts, tpots, latencies = [], [], []
+    for o in outputs:
+        m = o.metrics
+        n = len(o.outputs[0].token_ids)
+        if m and m.first_token_latency:
+            ttfts.append(m.first_token_latency)
+        if m and m.first_token_ts and m.last_token_ts and n > 1:
+            tpots.append((m.last_token_ts - m.first_token_ts) / (n - 1))
+        if m and m.last_token_ts and m.queued_ts:
+            latencies.append(m.last_token_ts - m.queued_ts)
     result = {"elapsed": elapsed, "total_completion": total_completion,
-              "ttfts": None, "tpots": None, "latencies": None}
+              "ttfts": ttfts or None, "tpots": tpots or None, "latencies": latencies or None}
 
-print("__RESULT__" + json.dumps(result))
+import tempfile, os
+result_path = workload_path.replace(".json", "_result.json")
+with open(result_path, "w") as f:
+    json.dump(result, f)
+print("__RESULT_FILE__" + result_path)
 '''
 
 
 def run_engine(python_path, engine, workload_dict):
+    import tempfile
     workload_dict["engine"] = engine
-    workload_json = json.dumps(workload_dict)
+    # Write workload to temp file (avoids ARG_MAX for large workloads)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(workload_dict, f)
+        workload_path = f.name
 
     print(f"  Starting {engine} ({python_path}) ...")
     proc = subprocess.run(
-        [python_path, "-c", BENCH_WORKER, workload_json],
-        capture_output=True, text=True, timeout=600,
+        [python_path, "-c", BENCH_WORKER, workload_path],
+        capture_output=True, text=True, timeout=3600,
         cwd="/root/zjh/nano-vllm",
     )
 
     for line in proc.stdout.splitlines():
-        if line.startswith("__RESULT__"):
-            return json.loads(line[len("__RESULT__"):])
+        if line.startswith("__RESULT_FILE__"):
+            result_path = line[len("__RESULT_FILE__"):]
+            with open(result_path) as f:
+                return json.load(f)
 
     print(f"  ERROR: {engine} did not produce results")
     for line in proc.stderr.strip().splitlines()[-20:]:
