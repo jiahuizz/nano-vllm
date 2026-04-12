@@ -1,8 +1,36 @@
 import os
 import time
+import numpy as np
 from random import randint, seed
 from nanovllm import LLM, SamplingParams
 # from vllm import LLM, SamplingParams
+
+
+def print_metrics(outputs):
+    ttfts = [o["metrics"]["ttft"] for o in outputs]
+    tpots = [o["metrics"]["tpot"] for o in outputs]
+    latencies = [o["metrics"]["latency"] for o in outputs]
+    prompt_toks = [o["metrics"]["prompt_tokens"] for o in outputs]
+    completion_toks = [o["metrics"]["completion_tokens"] for o in outputs]
+
+    total_prompt = sum(prompt_toks)
+    total_completion = sum(completion_toks)
+    total_time = max(latencies)
+
+    print(f"\n{'='*55}")
+    print(f"  Benchmark Results  ({len(outputs)} requests)")
+    print(f"{'='*55}")
+    print(f"  Tokens      : {total_prompt} prompt + {total_completion} completion = {total_prompt + total_completion} total")
+    print(f"  Throughput   : {total_completion / total_time:.1f} tok/s")
+    print(f"{'─'*55}")
+    print(f"  {'Metric':<14} {'Mean':>10} {'P50':>10} {'P99':>10}")
+    print(f"{'─'*55}")
+    for name, vals in [("TTFT (ms)", np.array(ttfts) * 1000),
+                       ("TPOT (ms)", np.array(tpots) * 1000),
+                       ("Latency (s)", np.array(latencies))]:
+        fmt = ".1f" if "ms" in name else ".2f"
+        print(f"  {name:<14} {np.mean(vals):>10{fmt}} {np.percentile(vals, 50):>10{fmt}} {np.percentile(vals, 99):>10{fmt}}")
+    print(f"{'='*55}\n")
 
 
 def main():
@@ -21,11 +49,12 @@ def main():
 
     llm.generate(["Benchmark: "], SamplingParams())
     t = time.time()
-    llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+    outputs = llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
     t = (time.time() - t)
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
     throughput = total_tokens / t
     print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s")
+    print_metrics(outputs)
 
 
 if __name__ == "__main__":

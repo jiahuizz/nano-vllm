@@ -49,9 +49,12 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        finished = []
+        for seq in seqs:
+            if seq.is_finished:
+                finished.append((seq.seq_id, seq.completion_token_ids, seq))
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-        return outputs, num_tokens
+        return finished, num_tokens
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -72,7 +75,7 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
+            finished, num_tokens = self.step()
             if use_tqdm:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)
@@ -82,12 +85,31 @@ class LLMEngine:
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for seq_id, token_ids, seq in finished:
+                ttft = seq.first_token_time - seq.created_time
+                n_completion = seq.num_completion_tokens
+                tpot = (seq.finished_time - seq.first_token_time) / max(n_completion - 1, 1)
+                latency = seq.finished_time - seq.created_time
+                # ITL: inter-token latencies (time between consecutive tokens)
+                ts = seq.token_timestamps
+                itl = [ts[i] - ts[i-1] for i in range(1, len(ts))] if len(ts) > 1 else []
+                outputs[seq_id] = {
+                    "token_ids": token_ids,
+                    "metrics": {
+                        "ttft": ttft,
+                        "tpot": tpot,
+                        "latency": latency,
+                        "itl": itl,
+                        "itl_mean": sum(itl) / len(itl) if itl else 0.0,
+                        "prompt_tokens": seq.num_prompt_tokens,
+                        "completion_tokens": n_completion,
+                    },
+                }
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        for o in outputs:
+            o["text"] = self.tokenizer.decode(o["token_ids"])
         if use_tqdm:
             pbar.close()
         return outputs
