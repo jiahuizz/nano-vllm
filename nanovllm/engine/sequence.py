@@ -86,12 +86,15 @@ class Sequence:
 
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.gdn_state_idx,
+                self.gdn_state_idx, getattr(self, '_prefill_chunk_size', 0),
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, self.gdn_state_idx = state[:-1]
+        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
+         self.block_table, self.gdn_state_idx, self._prefill_chunk_size) = state[:6]
+        last = state[6]
         if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
+            self.token_ids = last
+            self.last_token = last[-1] if last else 0
         else:
-            self.last_token = state[-1]
+            self.last_token = last

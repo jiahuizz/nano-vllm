@@ -188,25 +188,33 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
-            seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            seqlen_q = seqlen - seq.num_cached_tokens
-            seqlen_k = seqlen
+            # Chunked prefill: only process _prefill_chunk_size tokens (or all remaining)
+            chunk_size = getattr(seq, '_prefill_chunk_size', seq.num_prompt_tokens - seq.num_cached_tokens)
+            start_pos = seq.num_cached_tokens
+            end_pos = start_pos + chunk_size
+
+            input_ids.extend(seq[start_pos:end_pos])
+            positions.extend(list(range(start_pos, end_pos)))
+            seqlen_q = chunk_size
+            seqlen_k = end_pos  # attention sees all tokens up to end_pos
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
+            # Slot mapping: only for the chunk being processed
+            num_cached_blocks = seq.num_cached_tokens // self.block_size
+            num_end_blocks = (end_pos + self.block_size - 1) // self.block_size
+            for i in range(num_cached_blocks, num_end_blocks):
                 start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
+                if i != num_end_blocks - 1:
                     end = start + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens 
+                    remaining_in_block = end_pos - i * self.block_size
+                    end = start + remaining_in_block
                 slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache or chunked prefill
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -217,15 +225,18 @@ class ModelRunner:
         seq_lens = None
         if self.num_gdn_layers > 0:
             gdn_state_indices = torch.tensor([seq.gdn_state_idx for seq in seqs], dtype=torch.int64, device="cuda")
-            seq_lens = [len(seq) - seq.num_cached_tokens for seq in seqs]
-            # Zero GDN state for newly prefilled sequences (avoid stale state from previous occupants)
-            from nanovllm.layers.gdn import GDNAttention
-            for m in self.model.modules():
-                if isinstance(m, GDNAttention):
-                    if m.conv_state is not None:
-                        m.conv_state[gdn_state_indices] = 0
-                    if m.temporal_state is not None:
-                        m.temporal_state[gdn_state_indices] = 0
+            seq_lens = [getattr(seq, '_prefill_chunk_size', seq.num_prompt_tokens - seq.num_cached_tokens) for seq in seqs]
+            # Zero GDN state for first chunk of new sequences
+            if any(seq.num_cached_tokens == 0 for seq in seqs):
+                from nanovllm.layers.gdn import GDNAttention
+                new_indices = torch.tensor([seq.gdn_state_idx for seq in seqs if seq.num_cached_tokens == 0],
+                                          dtype=torch.int64, device="cuda")
+                for m in self.model.modules():
+                    if isinstance(m, GDNAttention):
+                        if m.conv_state is not None:
+                            m.conv_state[new_indices] = 0
+                        if m.temporal_state is not None:
+                            m.temporal_state[new_indices] = 0
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, gdn_state_indices, seq_lens)
         return input_ids, positions
 

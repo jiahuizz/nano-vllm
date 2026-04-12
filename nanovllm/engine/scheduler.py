@@ -28,44 +28,87 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        # prefill
-        scheduled_seqs = []
+        """Unified token-budget scheduler with chunked prefill.
+
+        Priority: decode first, then use remaining budget for prefill chunks.
+        Returns (scheduled_seqs, is_prefill).
+        """
+        # Phase 1: Schedule decode for running sequences that have completed prefill
+        decode_seqs = []
+        prefill_seqs = []
         num_seqs = 0
-        num_batched_tokens = 0
-        while self.waiting and num_seqs < self.max_num_seqs:
+
+        running_snapshot = list(self.running)
+        for seq in running_snapshot:
+            if num_seqs >= self.max_num_seqs:
+                break
+            # Sequence has completed prefill if num_cached_tokens >= num_prompt_tokens
+            if seq.num_cached_tokens >= seq.num_prompt_tokens:
+                # Decode: needs 1 new token
+                while not self.block_manager.can_append(seq):
+                    if self.running:
+                        victim = self.running.pop()
+                        if victim != seq:
+                            self.preempt(victim)
+                        else:
+                            self.preempt(seq)
+                            break
+                    else:
+                        self.preempt(seq)
+                        break
+                else:
+                    num_seqs += 1
+                    self.block_manager.may_append(seq)
+                    decode_seqs.append(seq)
+
+        # If we have decode work, do it (decode priority)
+        if decode_seqs:
+            return decode_seqs, False
+
+        # Phase 2: Schedule prefill (chunked)
+        token_budget = self.max_num_batched_tokens
+        num_seqs = 0
+
+        # 2a: Continue prefill for running sequences that haven't finished prefill
+        for seq in list(self.running):
+            if num_seqs >= self.max_num_seqs or token_budget <= 0:
+                break
+            if seq.num_cached_tokens < seq.num_prompt_tokens:
+                remaining = seq.num_prompt_tokens - seq.num_cached_tokens
+                chunk = min(remaining, token_budget)
+                seq._prefill_chunk_size = chunk
+                num_seqs += 1
+                token_budget -= chunk
+                prefill_seqs.append(seq)
+
+        # 2b: Start new sequences from waiting queue
+        while self.waiting and num_seqs < self.max_num_seqs and token_budget > 0:
             seq = self.waiting[0]
-            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
+            if not self.block_manager.can_allocate(seq):
                 break
             if self.has_gdn and not self.gdn_free_slots:
                 break
-            num_seqs += 1
+
+            remaining = seq.num_prompt_tokens - seq.num_cached_tokens
+            chunk = min(remaining, token_budget)
+            seq._prefill_chunk_size = chunk
+
             self.block_manager.allocate(seq)
             if self.has_gdn:
                 seq.gdn_state_idx = self.gdn_free_slots.popleft()
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
             self.running.append(seq)
-            scheduled_seqs.append(seq)
-        if scheduled_seqs:
-            return scheduled_seqs, True
 
-        # decode
-        while self.running and num_seqs < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
-                    break
-            else:
-                num_seqs += 1
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+            num_seqs += 1
+            token_budget -= chunk
+            prefill_seqs.append(seq)
+
+        if prefill_seqs:
+            return prefill_seqs, True
+
+        # Fallback: should not reach here if there's work to do
+        assert False, "Scheduler has work but couldn't schedule anything"
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
@@ -75,14 +118,21 @@ class Scheduler:
             seq.gdn_state_idx = -1
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
-        for seq, token_id in zip(seqs, token_ids):
-            seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                seq.finished_time = perf_counter()
-                self.block_manager.deallocate(seq)
-                if self.has_gdn and seq.gdn_state_idx >= 0:
-                    self.gdn_free_slots.appendleft(seq.gdn_state_idx)
-                    seq.gdn_state_idx = -1
-                self.running.remove(seq)
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int] | None, is_prefill: bool):
+        """Process results. For prefill: update num_cached_tokens. For decode: append token."""
+        if is_prefill:
+            for seq in seqs:
+                chunk = getattr(seq, '_prefill_chunk_size', seq.num_prompt_tokens - seq.num_cached_tokens)
+                seq.num_cached_tokens += chunk
+                # If prefill is complete, the next schedule() will put it in decode
+        else:
+            for seq, token_id in zip(seqs, token_ids):
+                seq.append_token(token_id)
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    seq.finished_time = perf_counter()
+                    self.block_manager.deallocate(seq)
+                    if self.has_gdn and seq.gdn_state_idx >= 0:
+                        self.gdn_free_slots.appendleft(seq.gdn_state_idx)
+                        seq.gdn_state_idx = -1
+                    self.running.remove(seq)
