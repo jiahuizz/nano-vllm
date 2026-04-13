@@ -2,6 +2,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+# Allow more torch.compile recompilations: RMSNorm is called with several
+# distinct ranks/shapes (2D for hidden states, 3D for q_norm/k_norm head dim).
+# Default cache_size_limit is 8 which gets hit quickly in this model.
+torch._dynamo.config.cache_size_limit = 64
+
 
 class RMSNorm(nn.Module):
 
@@ -24,6 +29,7 @@ class RMSNorm(nn.Module):
             return x * (1.0 + self.weight.float())
         return x * self.weight.float()
 
+    @torch.compile
     def rms_forward(
         self,
         x: torch.Tensor,
@@ -35,6 +41,7 @@ class RMSNorm(nn.Module):
         x = self._apply_weight(x).to(orig_dtype)
         return x
 
+    @torch.compile
     def add_rms_forward(
         self,
         x: torch.Tensor,
@@ -75,6 +82,7 @@ class RMSNormGated(nn.Module):
         else:
             self.weight = nn.Parameter(torch.ones(hidden_size))
 
+    @torch.compile
     def forward(
         self,
         x: torch.Tensor,
