@@ -7,12 +7,13 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
 
-    @torch.compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
-        # Greedy when temperature == 0, otherwise random sampling
         logits = logits.float()
-        # Clamp temperature to avoid div-by-zero; greedy is handled by the same argmax path
-        # (dividing by ~0 makes softmax a hard argmax)
+        # Greedy path: if any temperature is 0, use argmax (no noise)
+        # For simplicity, if ALL temperatures are 0, do pure greedy; otherwise do random sampling
+        if (temperatures == 0).all():
+            return logits.argmax(dim=-1)
+        # Random sampling via Gumbel-max trick
         temps = temperatures.unsqueeze(dim=1).clamp(min=1e-10)
         logits = logits.div_(temps)
         probs = torch.softmax(logits, dim=-1)

@@ -21,10 +21,9 @@ class RMSNorm(nn.Module):
 
     def _apply_weight(self, x):
         if self.add_unit_offset:
-            return x * (1.0 + self.weight)
-        return x * self.weight
+            return x * (1.0 + self.weight.float())
+        return x * self.weight.float()
 
-    @torch.compile
     def rms_forward(
         self,
         x: torch.Tensor,
@@ -36,7 +35,6 @@ class RMSNorm(nn.Module):
         x = self._apply_weight(x).to(orig_dtype)
         return x
 
-    @torch.compile
     def add_rms_forward(
         self,
         x: torch.Tensor,
@@ -77,7 +75,6 @@ class RMSNormGated(nn.Module):
         else:
             self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    @torch.compile
     def forward(
         self,
         x: torch.Tensor,
@@ -87,6 +84,6 @@ class RMSNormGated(nn.Module):
         x = x.float()
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
-        w = (1.0 + self.weight) if self.add_unit_offset else self.weight
+        w = (1.0 + self.weight.float()) if self.add_unit_offset else self.weight.float()
         x = (x * w).to(orig_dtype)
         return x * F.silu(z.float()).to(orig_dtype)

@@ -88,9 +88,10 @@ class SparseMoEBlock(nn.Module):
 
         # Router: softmax → top-k
         router_logits = self.gate(hidden_states)  # [N, num_experts]
-        scores = F.softmax(router_logits, dim=-1)
+        scores = F.softmax(router_logits, dim=-1, dtype=torch.float)
         topk_scores, topk_indices = scores.topk(self.num_experts_per_tok, dim=-1)
         topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)
+        topk_scores = topk_scores.to(router_logits.dtype)
 
         # Fused expert computation via Triton grouped GEMM
         from nanovllm.layers.fused_moe import fused_moe_forward
@@ -106,7 +107,12 @@ class SparseMoEBlock(nn.Module):
 
         # All-reduce across TP (down_proj is row-parallel)
         if self.tp_size > 1:
+            reduce_dtype = torch.float32 if output.dtype in (torch.float16, torch.bfloat16) else output.dtype
+            if reduce_dtype != output.dtype:
+                output = output.to(reduce_dtype)
             dist.all_reduce(output)
+            if reduce_dtype != hidden_states.dtype:
+                output = output.to(hidden_states.dtype)
 
         # Shared expert
         if self.has_shared_expert:
