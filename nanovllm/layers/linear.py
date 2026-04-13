@@ -161,10 +161,5 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
-            reduce_dtype = torch.float32 if y.dtype in (torch.float16, torch.bfloat16) else y.dtype
-            if reduce_dtype != y.dtype:
-                y = y.to(reduce_dtype)
             dist.all_reduce(y)
-            if reduce_dtype != x.dtype:
-                y = y.to(x.dtype)
         return y

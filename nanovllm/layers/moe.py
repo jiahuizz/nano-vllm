@@ -105,14 +105,11 @@ class SparseMoEBlock(nn.Module):
             self.act_fn,
         )
 
-        # All-reduce across TP (down_proj is row-parallel)
+        # All-reduce across TP (down_proj is row-parallel). Use bf16 directly
+        # to match vLLM's behavior — fp32 all-reduce is 2x slower for no
+        # observable greedy-token quality difference (see profile data).
         if self.tp_size > 1:
-            reduce_dtype = torch.float32 if output.dtype in (torch.float16, torch.bfloat16) else output.dtype
-            if reduce_dtype != output.dtype:
-                output = output.to(reduce_dtype)
             dist.all_reduce(output)
-            if reduce_dtype != hidden_states.dtype:
-                output = output.to(hidden_states.dtype)
 
         # Shared expert
         if self.has_shared_expert:
