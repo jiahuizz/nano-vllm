@@ -105,18 +105,30 @@ class SparseMoEBlock(nn.Module):
             self.act_fn,
         )
 
-        # All-reduce across TP (down_proj is row-parallel). Use bf16 directly
-        # to match vLLM's behavior — fp32 all-reduce is 2x slower for no
-        # observable greedy-token quality difference (see profile data).
-        if self.tp_size > 1:
-            dist.all_reduce(output)
-
-        # Shared expert
+        # Fuse shared_expert contribution with the main MoE all_reduce:
+        # both moe_output and shared_out are per-rank partial sums on the
+        # hidden dim, so we can add them together (with shared_gate applied)
+        # before a single all_reduce. Saves one all_reduce per MoE layer.
+        #
+        # The shared_gate * shared_out multiply is done in fp32 to match the
+        # precision of the original (all_reduce-then-multiply) formulation,
+        # otherwise bf16 non-associative rounding can flip a token ~50 into
+        # greedy decoding.
         if self.has_shared_expert:
             shared_gate_up = self.shared_expert.gate_up_proj(hidden_states)
             shared_act = self.act_fn(shared_gate_up)
-            shared_out = self.shared_expert.down_proj(shared_act)
+            shared_out_local = F.linear(shared_act, self.shared_expert.down_proj.weight)
             shared_gate = torch.sigmoid(self.shared_expert_gate(hidden_states))
-            output = output + shared_gate * shared_out
+            output = _fuse_shared_expert(output, shared_gate, shared_out_local)
+
+        if self.tp_size > 1:
+            dist.all_reduce(output)
 
         return output
+
+
+@torch.compile
+def _fuse_shared_expert(output, shared_gate, shared_out_local):
+    """torch.compile keeps intermediates in fp32 register between ops, avoiding
+    the eager-mode bf16 round that flipped greedy top-1 on near-tied logits."""
+    return output + shared_gate * shared_out_local
