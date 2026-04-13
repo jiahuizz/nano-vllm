@@ -29,7 +29,22 @@ class LLMEngine:
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
+        # Honor model's generation_config.eos_token_id (may be a list, e.g. Qwen3.5
+        # has both <|im_end|> and <|endoftext|>). Fall back to tokenizer's single eos.
+        eos_ids: set[int] = set()
+        try:
+            from transformers import GenerationConfig
+            gen_cfg = GenerationConfig.from_pretrained(config.model)
+            cfg_eos = gen_cfg.eos_token_id
+            if isinstance(cfg_eos, (list, tuple)):
+                eos_ids.update(int(x) for x in cfg_eos)
+            elif cfg_eos is not None:
+                eos_ids.add(int(cfg_eos))
+        except Exception:
+            pass
+        if self.tokenizer.eos_token_id is not None:
+            eos_ids.add(int(self.tokenizer.eos_token_id))
+        config.eos = eos_ids if eos_ids else {-1}
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
