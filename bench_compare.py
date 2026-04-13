@@ -76,10 +76,12 @@ output_lens = workload["output_lens"]
 tp_size = workload["tp"]
 enforce_eager = workload["enforce_eager"]
 
+max_num_seqs = workload.get("max_num_seqs", 32)
+
 if engine == "nanovllm":
     from nanovllm import LLM, SamplingParams
     llm = LLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tp_size,
-              max_model_len=2048, max_num_seqs=32)
+              max_model_len=2048, max_num_seqs=max_num_seqs)
     sampling_params = [SamplingParams(temperature=1.0, ignore_eos=True, max_tokens=ol) for ol in output_lens]
     llm.generate(["warmup"], SamplingParams(), use_tqdm=False)
     t0 = time.perf_counter()
@@ -95,7 +97,7 @@ if engine == "nanovllm":
 elif engine == "vllm":
     from vllm import LLM, SamplingParams
     llm = LLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tp_size,
-              max_model_len=2048, max_num_seqs=32, trust_remote_code=True,
+              max_model_len=2048, max_num_seqs=max_num_seqs, trust_remote_code=True,
               disable_log_stats=False)
     sampling_params = [SamplingParams(temperature=1.0, ignore_eos=True, max_tokens=ol) for ol in output_lens]
     prompts = [{"prompt_token_ids": p} for p in prompt_token_ids]
@@ -237,6 +239,7 @@ def main():
     parser.add_argument("--dataset", choices=["random", "sharegpt"], default="random")
     parser.add_argument("--dataset-path", default=None, help="Path to ShareGPT JSON")
     parser.add_argument("--num-seqs", type=int, default=32)
+    parser.add_argument("--max-num-seqs", type=int, default=32, help="concurrent batch size")
     parser.add_argument("--max-input-len", type=int, default=256)
     parser.add_argument("--max-output-len", type=int, default=256)
     parser.add_argument("--tp", type=int, default=4)
@@ -274,6 +277,7 @@ def main():
         "output_lens": output_lens,
         "tp": args.tp,
         "enforce_eager": args.enforce_eager,
+        "max_num_seqs": args.max_num_seqs,
     }
 
     python_path = NANO_PYTHON if args.engine == "nanovllm" else VLLM_PYTHON
