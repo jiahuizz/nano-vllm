@@ -162,12 +162,18 @@ class ModelRunner:
             return
 
         max_seqs = min(config.max_num_seqs, 128)  # limit GDN state memory
+        # Allocate ONE EXTRA slot at the end for "graph padding": when CUDA graph
+        # is captured at bs=N but actual decode bs is k<N, the [k:N] graph
+        # positions still execute and need somewhere to write their (garbage)
+        # GDN state — must NOT be a slot used by a real sequence.
+        self.gdn_dummy_slot = max_seqs
+        gdn_total_slots = max_seqs + 1
         for layer in gdn_layers:
             layer.conv_state = torch.zeros(
-                max_seqs, layer.conv_dim, layer.conv_kernel_size - 1,
+                gdn_total_slots, layer.conv_dim, layer.conv_kernel_size - 1,
                 dtype=torch.bfloat16, device="cuda")
             layer.temporal_state = torch.zeros(
-                max_seqs,
+                gdn_total_slots,
                 layer.num_v_heads // layer.tp_size,
                 layer.head_k_dim, layer.head_v_dim,
                 dtype=torch.float32, device="cuda")
@@ -224,7 +230,7 @@ class ModelRunner:
         gdn_state_indices = None
         seq_lens = None
         if self.num_gdn_layers > 0:
-            gdn_state_indices = torch.tensor([seq.gdn_state_idx for seq in seqs], dtype=torch.int64, device="cuda")
+            gdn_state_indices = torch.tensor([seq.gdn_state_idx for seq in seqs], dtype=torch.int32, device="cuda")
             seq_lens = [getattr(seq, '_prefill_chunk_size', seq.num_prompt_tokens - seq.num_cached_tokens) for seq in seqs]
             # Zero GDN state for first chunk of new sequences
             if any(seq.num_cached_tokens == 0 for seq in seqs):
@@ -257,7 +263,7 @@ class ModelRunner:
         block_tables = self.prepare_block_tables(seqs)
         gdn_state_indices = None
         if self.num_gdn_layers > 0:
-            gdn_state_indices = torch.tensor([seq.gdn_state_idx for seq in seqs], dtype=torch.int64, device="cuda")
+            gdn_state_indices = torch.tensor([seq.gdn_state_idx for seq in seqs], dtype=torch.int32, device="cuda")
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, gdn_state_indices=gdn_state_indices)
         return input_ids, positions
 
@@ -285,6 +291,10 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             if "gdn_state_indices" in graph_vars and context.gdn_state_indices is not None:
+                # Pad [bs:graph_bs] to a dummy GDN slot so the captured graph's
+                # tail positions write their garbage to a slot that no real seq
+                # uses (otherwise they overwrite an active seq's GDN state).
+                graph_vars["gdn_state_indices"].fill_(self.gdn_dummy_slot)
                 graph_vars["gdn_state_indices"][:bs] = context.gdn_state_indices
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
@@ -309,7 +319,13 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, text_config.hidden_size)
-        gdn_state_indices = torch.zeros(max_bs, dtype=torch.int64) if self.num_gdn_layers > 0 else None
+        # Initialize gdn_state_indices to unique slots [0, 1, 2, ..., max_bs-1]
+        # so that warmup/capture do not all write to slot 0 (race condition that
+        # leaves slot 0 in a polluted state and degrades the captured graph).
+        gdn_state_indices = (
+            torch.arange(max_bs, dtype=torch.int32, device="cuda")
+            if self.num_gdn_layers > 0 else None
+        )
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
