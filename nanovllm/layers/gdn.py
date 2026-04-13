@@ -2,12 +2,16 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+import os
 
 from nanovllm.layers.linear import (
     MergedColumnParallelLinear, ColumnParallelLinear, RowParallelLinear, divide,
 )
 from nanovllm.layers.layernorm import RMSNormGated
 from nanovllm.utils.context import get_context
+
+
+_GDN_DEBUG_SEEN: set[tuple[int, int]] = set()
 
 
 class GDNAttention(nn.Module):
@@ -121,9 +125,24 @@ class GDNAttention(nn.Module):
         return output
 
     def _causal_conv1d_decode(self, x: torch.Tensor, state_indices: torch.Tensor) -> torch.Tensor:
-        """Single-step causal conv1d for decode. Fused Triton kernel."""
-        from nanovllm.layers.gdn_kernels import fused_conv1d_update
-        return fused_conv1d_update(x, self.conv_state, self.conv1d.weight, state_indices, silu=False)
+        """Single-step causal conv1d for decode. Uses vLLM's causal_conv1d_update kernel.
+        Activation is fused ("silu") to match vLLM's fast path.
+        """
+        from nanovllm.layers.causal_conv1d_vllm import causal_conv1d_update
+        # state_indices must be int32 (kernel requirement) AND must be the same
+        # tensor identity across calls so CUDA graph replay sees fresh values.
+        # We rely on the caller (gdn_state_indices in context) to already be int32.
+        assert state_indices.dtype == torch.int32, (
+            f"state_indices must be int32 for CUDA graph safety, got {state_indices.dtype}"
+        )
+        return causal_conv1d_update(
+            x=x,
+            conv_state=self.conv_state,
+            weight=self.conv1d.weight,
+            bias=None,
+            activation="silu",  # fused silu inside kernel, vLLM style
+            conv_state_indices=state_indices,
+        )
 
     def _delta_rule_prefill(self, q, k, v, g, beta, seq_lens, state_indices):
         """Chunked delta rule for prefill using Triton FLA kernels.
@@ -194,7 +213,10 @@ class GDNAttention(nn.Module):
         qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
         z_size = self.value_dim // self.tp_size
         qkv, z = qkvz.split([qkv_size, z_size], dim=-1)
+        # Match vLLM: explicitly make b and a contiguous (ba.chunk returns views)
         b, a = ba.chunk(2, dim=-1)
+        b = b.contiguous()
+        a = a.contiguous()
 
         # 2. Causal Conv1d on QKV
         state_indices = context.gdn_state_indices
@@ -203,37 +225,120 @@ class GDNAttention(nn.Module):
             if seq_lens is None:
                 # Warmup: treat entire batch as one sequence, no state
                 seq_lens = [num_tokens]
-                state_indices = torch.zeros(1, dtype=torch.int64, device=hidden_states.device)
+                state_indices = torch.zeros(1, dtype=torch.int32, device=hidden_states.device)
             qkv = F.silu(self._causal_conv1d_prefill(qkv, seq_lens, state_indices))
-        else:
-            qkv = F.silu(self._causal_conv1d_decode(qkv, state_indices))
-
-        # 3. Split into Q, K, V and reshape
-        q_size = self.key_dim // self.tp_size
-        k_size = self.key_dim // self.tp_size
-        v_size = self.value_dim // self.tp_size
-        q, k, v_flat = qkv.split([q_size, k_size, v_size], dim=-1)
-        q = q.view(num_tokens, -1, self.head_k_dim)  # [N, num_k_heads/tp, head_k_dim]
-        k = k.view(num_tokens, -1, self.head_k_dim)
-        v = v_flat.view(num_tokens, -1, self.head_v_dim)  # [N, num_v_heads/tp, head_v_dim]
-        z = z.view(num_tokens, -1, self.head_v_dim)
-
-        # 4-5. Delta rule recurrence
-        if context.is_prefill:
+            # For prefill, we need q/k/v split for the prefill path (FLA chunked delta rule)
+            q_size = self.key_dim // self.tp_size
+            k_size = self.key_dim // self.tp_size
+            v_size = self.value_dim // self.tp_size
+            q, k, v_flat = qkv.split([q_size, k_size, v_size], dim=-1)
+            q = q.view(num_tokens, -1, self.head_k_dim)
+            k = k.view(num_tokens, -1, self.head_k_dim)
+            v = v_flat.view(num_tokens, -1, self.head_v_dim)
+            z = z.view(num_tokens, -1, self.head_v_dim)
             # Prefill: compute g, beta explicitly for HF's chunk implementation
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
             beta = torch.sigmoid(b)
             attn_out = self._delta_rule_prefill(q, k, v, g, beta, seq_lens, state_indices)
         else:
-            # Decode: fused Triton kernel computes g, beta internally from a, b, A_log, dt_bias
-            self._decode_a = a
-            self._decode_b = b
-            attn_out = self._delta_rule_decode(q, k, v, None, None, state_indices)
+            # Decode: pass mixed_qkv directly to vLLM's packed decode kernel.
+            # Don't split into q/k/v — the kernel reads q/k/v via offsets from mixed_qkv.
+            # (Silu is already fused into _causal_conv1d_decode via activation="silu".)
+            mixed_qkv = self._causal_conv1d_decode(qkv, state_indices)
+            z = z.view(num_tokens, -1, self.head_v_dim)
+
+            from nanovllm.layers.fla_ops.fused_recurrent import (
+                fused_recurrent_gated_delta_rule_packed_decode,
+            )
+            num_v_heads_tp = self.num_v_heads // self.tp_size
+            # Pre-allocate output in [B, 1, HV, V] shape as required
+            core_attn_out = torch.zeros(
+                num_tokens, 1, num_v_heads_tp, self.head_v_dim,
+                dtype=hidden_states.dtype, device=hidden_states.device,
+            )
+            # temporal_state is [max_seqs, HV, K, V] but kernel expects [..., HV, V, K]
+            # We need to transpose last 2 dims. Use a contiguous buffer view.
+            # NOTE: this transposes IN-PLACE via .transpose which returns a view;
+            # the kernel requires stride(-1)==1 so we must materialize.
+            ssm_state_view = self.temporal_state.transpose(-1, -2).contiguous()
+            # state_indices already int32; passing it directly preserves tensor
+            # identity for CUDA graph replay (a `.to(int32)` would allocate a new
+            # tensor each call and make the captured pointer stale).
+            assert state_indices.dtype == torch.int32
+            fused_recurrent_gated_delta_rule_packed_decode(
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                scale=self.head_k_dim ** -0.5,
+                initial_state=ssm_state_view,
+                out=core_attn_out,
+                ssm_state_indices=state_indices,
+                use_qk_l2norm_in_kernel=True,
+            )
+            # Write back updated state: kernel updates ssm_state_view in place (ht=h0)
+            self.temporal_state.copy_(ssm_state_view.transpose(-1, -2).contiguous())
+            # core_attn_out has shape [B, 1, HV, V], squeeze to [B, HV, V]
+            attn_out = core_attn_out.squeeze(1)
 
         # 6. Output: RMSNormGated(output, z) -> out_proj
         attn_out = attn_out.reshape(-1, self.head_v_dim)
         z_flat = z.reshape(-1, self.head_v_dim)
         attn_out = self.norm(attn_out, z_flat)
         attn_out = attn_out.view(num_tokens, -1)  # [N, value_dim/tp]
+
+        debug_enabled = (
+            os.getenv("NANOVLLM_DEBUG_GDN_TP") == "1"
+            and context.is_prefill
+            and context.seq_lens is not None
+            and len(context.seq_lens) == 3
+            and sum(context.seq_lens) == num_tokens
+            and context.seq_lens[0] == context.seq_lens[1] == context.seq_lens[2]
+        )
+
+        if debug_enabled:
+            rank = dist.get_rank()
+            key = (rank, id(self))
+            if key not in _GDN_DEBUG_SEEN:
+                _GDN_DEBUG_SEEN.add(key)
+
+                def _max_pair_diff(x: torch.Tensor) -> float:
+                    l0, l1, l2 = context.seq_lens
+                    s0 = x[:l0].float()
+                    s1 = x[l0:l0 + l1].float()
+                    s2 = x[l0 + l1:l0 + l1 + l2].float()
+                    return max(
+                        (s0 - s1).abs().max().item(),
+                        (s0 - s2).abs().max().item(),
+                    )
+
+                local_out = F.linear(attn_out, self.out_proj.weight, None)
+                local_diff = _max_pair_diff(local_out)
+                with open(f"/tmp/gdn_tp_rank{rank}.log", "a", encoding="utf-8") as f:
+                    f.write(
+                        f"local_diff={local_diff:.8f} "
+                        f"attn_out_diff={_max_pair_diff(attn_out):.8f}\n"
+                    )
+
         output = self.out_proj(attn_out)
+
+        if debug_enabled:
+            rank = dist.get_rank()
+            key = (rank, id(self), "reduced")
+            if key not in _GDN_DEBUG_SEEN:
+                _GDN_DEBUG_SEEN.add(key)
+
+                def _max_pair_diff_out(x: torch.Tensor) -> float:
+                    l0, l1, l2 = context.seq_lens
+                    s0 = x[:l0].float()
+                    s1 = x[l0:l0 + l1].float()
+                    s2 = x[l0 + l1:l0 + l1 + l2].float()
+                    return max(
+                        (s0 - s1).abs().max().item(),
+                        (s0 - s2).abs().max().item(),
+                    )
+
+                with open(f"/tmp/gdn_tp_rank{rank}.log", "a", encoding="utf-8") as f:
+                    f.write(f"reduced_diff={_max_pair_diff_out(output):.8f}\n")
         return output

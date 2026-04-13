@@ -78,7 +78,14 @@ def fused_conv1d_update(
     state_indices: torch.Tensor,  # [batch]
     silu: bool = True,
 ) -> torch.Tensor:
-    """Fused causal conv1d single-step decode. Returns output same shape as x."""
+    """Fused causal conv1d single-step decode. Returns output same shape as x.
+
+    NOTE: x may be a non-contiguous view (e.g. from qkvz.split()) so we must
+    call .contiguous() before passing to the Triton kernel, which assumes
+    stride == conv_dim on the batch dim. conv_state and weight are also
+    required to be contiguous.
+    """
+    x = x.contiguous()
     batch, conv_dim = x.shape
     out = torch.empty_like(x)
     BLOCK_D = 256
