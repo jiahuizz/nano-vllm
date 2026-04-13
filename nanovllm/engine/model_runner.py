@@ -130,7 +130,12 @@ class ModelRunner:
             num_attn_layers = text_config.num_hidden_layers
 
         total_kv_heads = text_config.num_key_value_heads
-        num_kv_heads = max(1, total_kv_heads // self.world_size) if total_kv_heads >= self.world_size else total_kv_heads
+        # When total_kv_heads < world_size, vLLM gives each rank ONE kv head
+        # (replicated across ceil(world_size/total_kv_heads) ranks). This gives
+        # correct GQA grouping inside flash_attn (group = num_q_local / 1).
+        # The previous formula left num_kv_heads = total_kv_heads (= 2) which
+        # made flash_attn split q heads across the wrong kv heads.
+        num_kv_heads = max(1, total_kv_heads // self.world_size)
         head_dim = getattr(text_config, "head_dim", text_config.hidden_size // text_config.num_attention_heads)
 
         # Allocate GDN state if model has GDN layers

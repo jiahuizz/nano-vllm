@@ -30,14 +30,26 @@ class Qwen3_5MoeAttention(nn.Module):
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
+        self.tp_size = tp_size
+        self.tp_rank = dist.get_rank()
         self.total_num_heads = num_heads
         self.num_heads = num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        # When KV heads < TP size, replicate KV heads across GPUs
+        # When KV heads < TP size, vLLM gives each rank ONE kv head
+        # (replicated across multiple ranks). nano-vllm previously kept all kv
+        # heads per rank which gave wrong GQA grouping (group_size = num_q/num_kv
+        # per rank, but global grouping is num_q_global/num_kv_global). The fix:
+        # 1 kv head per rank, sliced based on tp_rank.
         if num_kv_heads >= tp_size:
             self.num_kv_heads = num_kv_heads // tp_size
+            self.num_kv_head_replicas = 1
         else:
-            self.num_kv_heads = num_kv_heads
+            assert tp_size % num_kv_heads == 0
+            self.num_kv_heads = 1
+            # How many ranks share each kv head (e.g., tp=4, kv=2 → 2 ranks/kv)
+            self.num_kv_head_replicas = tp_size // num_kv_heads
+        # The kv head index this rank owns (in the global kv head space)
+        self.kv_head_idx = self.tp_rank // self.num_kv_head_replicas
         self.head_dim = head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -93,25 +105,27 @@ class Qwen3_5MoeAttention(nn.Module):
 
         # Separate Q and Gate within each head
         q_gate = q_gate.view(-1, self.num_heads, self.head_dim * 2)
-        q, gate = q_gate.chunk(2, dim=-1)  # each [N, num_heads, head_dim]
+        q, gate = q_gate.chunk(2, dim=-1)
 
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        # Reshape kv to [N, total_num_kv_heads, head_dim]; when KV is replicated
+        # across ranks (total_num_kv_heads < tp_size), each rank only needs the
+        # ONE kv head matching its q head shard — slice to that.
+        k = k.view(-1, self.total_num_kv_heads, self.head_dim)
+        v = v.view(-1, self.total_num_kv_heads, self.head_dim)
+        if self.num_kv_head_replicas > 1:
+            k = k[:, self.kv_head_idx:self.kv_head_idx + self.num_kv_heads].contiguous()
+            v = v[:, self.kv_head_idx:self.kv_head_idx + self.num_kv_heads].contiguous()
 
-        # Normalize Q and K
         q = self.q_norm(q)
         k = self.k_norm(k)
-
         q, k = self.rotary_emb(positions, q, k)
 
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
         o = self.attn(q, k, v)
 
-        # Output gate
         gate = torch.sigmoid(gate.reshape(-1, self.num_heads * self.head_dim))
         o = o.flatten(1, -1) * gate
 
-        output = self.o_proj(o)
-        return output
+        return self.o_proj(o)
 
 
 class Qwen3_5MoeDecoderLayer(nn.Module):
