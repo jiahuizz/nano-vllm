@@ -46,14 +46,29 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
         finished = []
-        for seq in seqs:
-            if seq.is_finished:
-                finished.append((seq.seq_id, seq.completion_token_ids, seq))
-        num_tokens = sum(getattr(seq, '_prefill_chunk_size', len(seq)) for seq in seqs) if is_prefill else -len(seqs)
+        num_tokens = 0
+
+        # Phase 1: Decode all running seqs that have completed prefill
+        decode_seqs = self.scheduler.schedule_decode()
+        if decode_seqs:
+            token_ids = self.model_runner.call("run", decode_seqs, False)
+            self.scheduler.postprocess_decode(decode_seqs, token_ids)
+            for seq in decode_seqs:
+                if seq.is_finished:
+                    finished.append((seq.seq_id, seq.completion_token_ids, seq))
+            num_tokens = -len(decode_seqs)
+
+        # Phase 2: Prefill new/partial seqs (slots freed by finished decode seqs are now available)
+        prefill_seqs = self.scheduler.schedule_prefill()
+        if prefill_seqs:
+            token_ids = self.model_runner.call("run", prefill_seqs, True)
+            self.scheduler.postprocess_prefill(prefill_seqs, token_ids)
+            for seq in prefill_seqs:
+                if seq.is_finished:
+                    finished.append((seq.seq_id, seq.completion_token_ids, seq))
+            num_tokens = sum(getattr(seq, '_prefill_chunk_size', len(seq)) for seq in prefill_seqs)
+
         return finished, num_tokens
 
     def is_finished(self):
