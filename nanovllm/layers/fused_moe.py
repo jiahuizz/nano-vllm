@@ -215,21 +215,69 @@ class FusedMoECache:
 _MOE_CACHE: dict[int, FusedMoECache] = {}
 
 
-def _get_config(M, N, K):
-    if M <= 16:
-        return {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1}
-    elif M <= 64:
-        return {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1}
+def _get_config(M: int, E: int, N: int, K: int, top_k: int) -> dict:
+    """Mirror of vLLM's fused_moe.get_default_config for bf16 / non-quantized case.
+
+    M here is the REQUEST-level batch size (num rows of the input A, before
+    top-k expansion), not num_tokens_post_padded. vLLM tunes tile sizes based
+    on request count, not the kernel's internal expansion.
+    """
+    # BLOCK_M grows with batch, but slower than M * top_k so we keep enough
+    # parallelism for small batches and enough arithmetic intensity for large.
+    if M <= 32:
+        block_m = 16
+    elif M <= 96:
+        block_m = 32
+    elif M <= 512:
+        block_m = 64
     else:
-        return {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32, "GROUP_SIZE_M": 8}
+        block_m = 128
+
+    # Small batches are memory-bound → favor tall-K tiles (larger K).
+    block_n = 64 if M <= 64 else 128
+    block_k = 128 if M <= 64 else 64
+
+    # GROUP_SIZE_M helps adjacent M-blocks share weight tiles in L2, but only
+    # pays off when each expert has many M-blocks. In Qwen3.5-35B-A3B we have
+    # 256 experts and typical decode M=64 → tokens_per_expert ≈ 2 → grouping
+    # HURTS because M-blocks rarely belong to the same expert.
+    tokens_per_expert = M // max(E, 1)
+    group_m = 16 if tokens_per_expert > 128 else 1
+
+    # More warps = more parallelism within a block = higher arithmetic intensity,
+    # but only when blocks are big enough to saturate. M > 128 means large
+    # batches where 8 warps (256 threads) fit well.
+    num_warps = 4 if M <= 128 else 8
+
+    # Pipeline depth: small M has less work to hide latency, so shallower
+    # pipeline (stages=4 on tiny batches actually helps by giving the
+    # scheduler more independent loads to pick from).
+    num_stages = 4 if M <= 32 else 3
+
+    return {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": block_k,
+        "GROUP_SIZE_M": group_m,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
 
 
 def invoke_fused_moe(A, B, C, topk_weights, sorted_token_ids, expert_ids,
-                     num_tokens_post_padded, mul_routed_weight, top_k):
+                     num_tokens_post_padded, mul_routed_weight, top_k,
+                     num_requests, num_experts):
+    """Launch fused MoE kernel.
+
+    num_requests: A.size(0) / top_k at the original call site (or A.size(0) if
+        top_k=1 like GEMM2). Used for config selection.
+    num_experts: total experts, used to compute tokens_per_expert for the
+        GROUP_SIZE_M heuristic.
+    """
     M = A.size(0)
     N, K = B.size(1), B.size(2)
     EM = sorted_token_ids.size(0)
-    config = _get_config(M * top_k, N, K)
+    config = _get_config(num_requests, num_experts, N, K, top_k)
     grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
@@ -259,16 +307,20 @@ def fused_moe_forward(
     top_k = topk_ids.size(1)
     gate_up_size = w1.size(1)
     inter_size = w2.size(2)
-    config = _get_config(M * top_k, gate_up_size, hidden)
+    # Use request-level M for config selection (matches vLLM semantics).
+    config = _get_config(M, num_experts, gate_up_size, hidden, top_k)
     block_size = config["BLOCK_SIZE_M"]
 
-    # Get or create cache (keyed by device ordinal to support TP)
+    # Get or create cache (keyed by device ordinal to support TP). Use the
+    # MAX possible block_size for sizing cache buffers so any runtime config
+    # (block_m ∈ {16, 32, 64, 128}) fits.
+    MAX_BLOCK_M = 128
     device_idx = hidden_states.device.index or 0
     cache = _MOE_CACHE.get(device_idx)
     if cache is None or cache.intermediate1.size(0) < M * top_k:
         max_tokens = max(M, 512)  # pre-allocate for up to 512 tokens
         cache = FusedMoECache(max_tokens, top_k, gate_up_size, inter_size, hidden,
-                              num_experts, block_size, hidden_states.dtype, hidden_states.device)
+                              num_experts, MAX_BLOCK_M, hidden_states.dtype, hidden_states.device)
         _MOE_CACHE[device_idx] = cache
 
     mt = M * top_k
@@ -286,6 +338,7 @@ def fused_moe_forward(
         sorted_token_ids=sorted_token_ids, expert_ids=expert_ids,
         num_tokens_post_padded=num_tokens_post_padded,
         mul_routed_weight=False, top_k=top_k,
+        num_requests=M, num_experts=num_experts,
     )
 
     # 3. Activation in-place
@@ -300,6 +353,7 @@ def fused_moe_forward(
         sorted_token_ids=sorted_token_ids, expert_ids=expert_ids,
         num_tokens_post_padded=num_tokens_post_padded,
         mul_routed_weight=True, top_k=1,
+        num_requests=M, num_experts=num_experts,
     )
 
     # 5. Aggregate
